@@ -6,7 +6,6 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/hex"
-	stderrors "errors"
 	"io"
 	"strconv"
 	"strings"
@@ -19,10 +18,11 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	sessionctx "github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/singbridge"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/anytls/singbridge"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
@@ -49,6 +49,9 @@ type session struct {
 	handshakeDone    bool
 	clientPaddingMD5 string
 	noTLS            bool
+	idleMu           sync.Mutex
+	lastReadTime     time.Time
+	connectionIdle   time.Duration
 
 	client       *Client
 	nextSID      atomic.Uint32
@@ -65,6 +68,69 @@ type session struct {
 	idleSinceNano atomic.Int64
 	inIdlePool    atomic.Bool
 	dieHook       func()
+}
+
+const serverHeartbeatTimeout = 30 * time.Second
+
+type serverIdleReader struct {
+	buf.Reader
+	session *session
+}
+
+func (r *serverIdleReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.Reader.ReadMultiBuffer()
+	if !mb.IsEmpty() {
+		r.session.idleMu.Lock()
+		r.session.lastReadTime = time.Now()
+		r.session.idleMu.Unlock()
+	}
+	return mb, err
+}
+
+// Keeping the watchdog independent of frame writes lets it close the session
+// even while the heartbeat sender is waiting for writeMu or the network.
+func (s *session) watchServerIdle(ctx context.Context, stop <-chan struct{}) {
+	timer := time.NewTimer(s.connectionIdle)
+	defer timer.Stop()
+	var probeReadTime time.Time
+	var sendDone chan error
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+			s.close(ctx.Err())
+			return
+		case err := <-sendDone:
+			sendDone = nil
+			if err != nil {
+				s.close(err)
+				return
+			}
+		case <-timer.C:
+			s.idleMu.Lock()
+			lastRead := s.lastReadTime
+			s.idleMu.Unlock()
+			if !probeReadTime.IsZero() && lastRead.Equal(probeReadTime) {
+				s.close(errors.New("anytls: heartbeat timeout"))
+				return
+			}
+			probeReadTime = time.Time{}
+			if remaining := s.connectionIdle - time.Since(lastRead); remaining > 0 {
+				timer.Reset(remaining)
+				continue
+			}
+			probeReadTime = lastRead
+			timer.Reset(serverHeartbeatTimeout)
+			// At most one heartbeat write may be outstanding per session.
+			if sendDone == nil {
+				sendDone = make(chan error, 1)
+				go func(result chan<- error) {
+					result <- s.sendFrame(newFrame(cmdHeartRequest, 0))
+				}(sendDone)
+			}
+		}
+	}
 }
 
 func (s *session) dispatchContext(ctx context.Context, st *stream) context.Context {
@@ -114,7 +180,7 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.Mult
 			return err
 		}
 		if !body.IsEmpty() {
-			return s.feedUDP(dispatchCtx, st, body)
+			return s.handleUDPFrame(dispatchCtx, st, body)
 		}
 		return nil
 	} else if strings.Contains(dest.Address.String(), "udp-over-tcp.arpa") {
@@ -123,6 +189,15 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.Mult
 		s.finishStream(st.sid, nil)
 		return nil
 	}
+	accessMessage := &log.AccessMessage{
+		From:   s.conn.RemoteAddr(),
+		To:     dest,
+		Status: log.AccessAccepted,
+	}
+	if inbound := sessionctx.InboundFromContext(ctx); inbound != nil && inbound.User != nil {
+		accessMessage.Email = inbound.User.Email
+	}
+	dispatchCtx = log.ContextWithAccessMessage(dispatchCtx, accessMessage)
 
 	l, err := s.dispatcher.Dispatch(dispatchCtx, dest)
 	if err != nil {
@@ -145,134 +220,112 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.Mult
 	return nil
 }
 
-// isIncompleteRead reports whether err is the result of a short/truncated read,
-// i.e. the UoT stream simply has not delivered enough bytes yet (as opposed to a
-// genuinely malformed frame). Such reads must be retried once more data arrives.
-func isIncompleteRead(err error) bool {
-	return stderrors.Is(err, io.EOF) || stderrors.Is(err, io.ErrUnexpectedEOF)
-}
+func (s *session) handleUDPFrame(ctx context.Context, st *stream, body buf.MultiBuffer) error {
+	st.udpLastActive.Store(time.Now().UnixNano())
+	st.uotInput = appendMultiBuffer(st.uotInput, body)
+	if st.uotRequest == nil {
+		reader := bytes.NewReader(st.uotInput)
+		request, err := uot.ReadRequest(reader)
+		if err != nil {
+			return s.rejectUDPStream(ctx, st, errors.New("anytls: UDP failed to parse request").Base(err))
+		}
+		st.uotRequest = request
+		st.udpIsConnect = request.IsConnect
+		st.consumeUoTInput(len(st.uotInput) - reader.Len())
 
-// failUDP tears down a single UDP stream after an unrecoverable protocol error
-// without killing the whole session (matching the previous behaviour).
-func (s *session) failUDP(ctx context.Context, st *stream, msg string, err error) error {
-	errors.LogWarning(ctx, "anytls: "+msg, ", streamId=", st.sid, " err=", err)
-	_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-	s.finishStream(st.sid, nil)
-	return nil
-}
+		requestDest, err := singbridge.ToDestination(request.Destination, net.Network_UDP)
+		if err != nil {
+			return s.rejectUDPStream(ctx, st, errors.New("anytls: UDP invalid destination").Base(err))
+		}
+		dispatchCtx := s.dispatchContext(ctx, st)
+		accessMessage := &log.AccessMessage{
+			From:   s.conn.RemoteAddr(),
+			To:     requestDest,
+			Status: log.AccessAccepted,
+		}
+		if inbound := sessionctx.InboundFromContext(ctx); inbound != nil && inbound.User != nil {
+			accessMessage.Email = inbound.User.Email
+		}
+		dispatchCtx = log.ContextWithAccessMessage(dispatchCtx, accessMessage)
+		link, err := s.dispatcher.Dispatch(dispatchCtx, requestDest)
+		if err != nil {
+			return s.rejectUDPStream(ctx, st, errors.New("anytls: UDP dispatcher error").Base(err))
+		}
+		st.link = link
+		s.armUDPIdle(st)
+		go s.pumpUoTDownlink(st.sid, st, link, request.IsConnect, request.Destination)
+	}
 
-// writeUDPDatagram forwards exactly one UDP datagram to the dispatched link.
-// Each datagram is written as a single buffer so the outbound treats it as one
-// packet, and b.UDP carries the explicit destination.
-func (s *session) writeUDPDatagram(st *stream, dest net.Destination, payload []byte) error {
-	b := buf.NewWithSize(int32(len(payload)))
-	if len(payload) > 0 {
-		if _, err := b.Write(payload); err != nil {
-			b.Release()
+	for {
+		if len(st.uotInput) == 0 {
+			return nil
+		}
+		dest := st.uotRequest.Destination
+		offset := 0
+		if !st.udpIsConnect {
+			reader := bytes.NewReader(st.uotInput)
+			var err error
+			dest, err = uot.AddrParser.ReadAddrPort(reader)
+			if err != nil {
+				return s.rejectUDPStream(ctx, st, errors.New("anytls: UDP packet has invalid destination address").Base(err))
+			}
+			offset = len(st.uotInput) - reader.Len()
+		}
+		if len(st.uotInput) < offset+2 {
+			return nil
+		}
+		length := int(binary.BigEndian.Uint16(st.uotInput[offset : offset+2]))
+		if len(st.uotInput) < offset+2+length {
+			return nil
+		}
+		if err := s.writeUoTPacket(ctx, st, dest, st.uotInput[offset+2:offset+2+length]); err != nil {
 			return err
 		}
+		st.consumeUoTInput(offset + 2 + length)
 	}
-	d := dest
-	b.UDP = &d
+}
+
+func appendMultiBuffer(dst []byte, mb buf.MultiBuffer) []byte {
+	for _, b := range mb {
+		if b != nil {
+			dst = append(dst, b.Bytes()...)
+		}
+	}
+	buf.ReleaseMulti(mb)
+	return dst
+}
+
+func (st *stream) consumeUoTInput(length int) {
+	remaining := len(st.uotInput) - length
+	if remaining == 0 {
+		st.uotInput = st.uotInput[:0]
+		return
+	}
+	copy(st.uotInput, st.uotInput[length:])
+	st.uotInput = st.uotInput[:remaining]
+}
+
+func (s *session) writeUoTPacket(ctx context.Context, st *stream, addr M.Socksaddr, payload []byte) error {
+	dest, err := singbridge.ToDestination(addr, net.Network_UDP)
+	if err != nil {
+		return s.rejectUDPStream(ctx, st, errors.New("anytls: UDP invalid destination").Base(err))
+	}
+	if st.link == nil {
+		return errors.New("anytls: UDP stream without link")
+	}
+
+	b := buf.NewWithSize(int32(len(payload)))
+	if len(payload) > 0 {
+		copy(b.Extend(int32(len(payload))), payload)
+	}
+	b.UDP = &dest
 	return st.link.Writer.WriteMultiBuffer(buf.MultiBuffer{b})
 }
 
-// feedUDP is the unified UoT uplink handler. UoT is a continuous byte stream
-// ([request][addr?][len][payload]...) whose datagram boundaries are independent
-// of how the data is split into PSH frames. It therefore accumulates the raw
-// bytes and extracts every complete datagram, keeping any partial tail for the
-// next frame.
-func (s *session) feedUDP(ctx context.Context, st *stream, body buf.MultiBuffer) error {
-	// Any PSH frame for this stream is uplink activity; refresh the idle clock.
-	st.udpLastActive.Store(time.Now().UnixNano())
-	for _, b := range body {
-		if b != nil && !b.IsEmpty() {
-			st.udpBuf = append(st.udpBuf, b.Bytes()...)
-		}
-	}
-	buf.ReleaseMulti(body)
-
-	off := 0
-	for off < len(st.udpBuf) {
-		slice := st.udpBuf[off:]
-		r := bytes.NewReader(slice)
-
-		// The UoT request header is present exactly once, at the very start.
-		if !st.udpReqParsed {
-			request, err := uot.ReadRequest(r)
-			if err != nil {
-				if isIncompleteRead(err) {
-					break
-				}
-				return s.failUDP(ctx, st, "UDP failed to parse request", err)
-			}
-			requestDest, derr := singbridge.ToDestination(request.Destination, net.Network_UDP)
-			if derr != nil {
-				return s.failUDP(ctx, st, "UDP invalid destination", derr)
-			}
-			link, lerr := s.dispatcher.Dispatch(s.dispatchContext(ctx, st), requestDest)
-			if lerr != nil {
-				return s.failUDP(ctx, st, "UDP dispatcher error", lerr)
-			}
-			st.link = link
-			st.udpTarget = &requestDest
-			st.udpIsConnect = request.IsConnect
-			st.udpReqParsed = true
-			// Arm the idle watchdog before starting the pump so its cleanup
-			// always sees a non-nil timer.
-			s.armUDPIdle(st)
-			go s.pumpUoTDownlink(st, link, request.IsConnect, request.Destination)
-			off += len(slice) - r.Len()
-			continue
-		}
-
-		// Per-packet destination is only present in non-connect (full-cone) mode.
-		pktDest := *st.udpTarget
-		if !st.udpIsConnect {
-			addr, err := uot.AddrParser.ReadAddrPort(r)
-			if err != nil {
-				if isIncompleteRead(err) {
-					break
-				}
-				return s.failUDP(ctx, st, "UDP packet missing destination address", err)
-			}
-			d, derr := singbridge.ToDestination(addr, net.Network_UDP)
-			if derr != nil {
-				return s.failUDP(ctx, st, "UDP packet has invalid destination address", derr)
-			}
-			pktDest = d
-		}
-
-		var length uint16
-		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
-			// length header not fully arrived yet; wait for the next frame.
-			break
-		}
-		headerLen := len(slice) - r.Len()
-		if headerLen+int(length) > len(slice) {
-			// payload not fully arrived yet; keep the partial tail.
-			break
-		}
-		payload := slice[headerLen : headerLen+int(length)]
-
-		// Full-cone (non-connect) traffic to many destinations all flows over
-		// the single link dispatched when the UoT request was parsed; the
-		// per-packet destination is carried via b.UDP (set in writeUDPDatagram)
-		// and honoured by the outbound. We must NOT re-dispatch / spawn a new
-		// downlink pump per destination: that both deviates from how xray
-		// handles full-cone UDP and leaks pump goroutines (a pump whose stream
-		// was already removed from s.streams never gets its link closed and
-		// blocks forever on Read).
-		if err := s.writeUDPDatagram(st, pktDest, payload); err != nil {
-			return err
-		}
-		off += headerLen + int(length)
-	}
-
-	// Drop consumed bytes, retaining only the not-yet-complete tail.
-	if off > 0 {
-		st.udpBuf = append(st.udpBuf[:0], st.udpBuf[off:]...)
-	}
+func (s *session) rejectUDPStream(ctx context.Context, st *stream, err error) error {
+	errors.LogWarning(ctx, err, ", streamId=", st.sid)
+	_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+	s.finishStream(st.sid, nil)
 	return nil
 }
 
@@ -303,31 +356,21 @@ func (s *session) pumpDownlink(sid uint32, link *transport.Link) {
 	}
 }
 
-// anytlsUDPIdleTimeout reaps UoT streams with no traffic in either direction
-// for this long. UDP outbounds never EOF on their own and many clients never
-// FIN idle UDP associations (DNS, abandoned QUIC, TUN short flows); without an
-// explicit reaper the per-stream downlink pump blocks on the pipe forever and
-// the goroutine leaks. This timeout is independent of (and may be shorter
-// than) the outbound ConnectionIdle policy: it only fires after full
-// bidirectional silence, so genuinely active associations are never dropped.
-// 120s matches common UDP NAT association timeouts.
+// anytlsUDPIdleTimeout reaps UoT streams with no traffic in either direction.
+// Many clients never FIN idle UDP associations (DNS, abandoned QUIC, TUN short
+// flows), so this bounds their lifetime independently of the outbound.
 const anytlsUDPIdleTimeout = 120 * time.Second
 
-// armUDPIdle starts a self-rescheduling inactivity watchdog for a UDP stream.
-// time.AfterFunc keeps no goroutine parked while waiting; it only runs when it
-// fires, at which point it either reaps a truly idle stream or reschedules.
 func (s *session) armUDPIdle(st *stream) {
 	st.udpIdleTimer = time.AfterFunc(anytlsUDPIdleTimeout, func() {
 		s.streamsMu.Lock()
-		_, alive := s.streams[st.sid]
+		alive := s.streams[st.sid] == st
 		s.streamsMu.Unlock()
 		if !alive {
-			return // stream already gone; stop rescheduling
+			return
 		}
 		idle := time.Duration(time.Now().UnixNano() - st.udpLastActive.Load())
 		if idle >= anytlsUDPIdleTimeout {
-			// No traffic for the whole window: close the stream, which unblocks
-			// and ends the downlink pump.
 			s.finishStream(st.sid, nil)
 			return
 		}
@@ -335,17 +378,23 @@ func (s *session) armUDPIdle(st *stream) {
 	})
 }
 
-func (s *session) pumpUoTDownlink(st *stream, link *transport.Link, isConnect bool, dest M.Socksaddr) {
-	sid := st.sid
+func (s *session) pumpUoTDownlink(sid uint32, st *stream, link *transport.Link, isConnect bool, dest M.Socksaddr) {
 	defer func() {
 		if st.udpIdleTimer != nil {
 			st.udpIdleTimer.Stop()
 		}
 		s.streamsMu.Lock()
-		delete(s.streams, sid)
+		current := s.streams[sid]
+		active := current == st && st.link == link
+		if active {
+			delete(s.streams, sid)
+		}
 		s.streamsMu.Unlock()
 		common.Close(link.Writer)
 		common.Interrupt(link.Reader)
+		if !active {
+			return
+		}
 		if !s.isClosed() {
 			_ = s.sendFrame(newFrame(cmdFIN, sid))
 		}
@@ -356,30 +405,35 @@ func (s *session) pumpUoTDownlink(st *stream, link *transport.Link, isConnect bo
 		if err != nil {
 			break
 		}
-		// Downlink data arrived; refresh the idle clock.
 		st.udpLastActive.Store(time.Now().UnixNano())
-		// Each buffer is one UDP datagram. Frame every datagram independently so
-		// the peer's stream parser sees correct UoT packet boundaries; merging
-		// them under a single length header would corrupt the stream.
-		for _, b := range mb {
+		for {
+			var b *buf.Buffer
+			mb, b = buf.SplitFirst(mb)
 			if b == nil {
+				break
+			}
+			length := b.Len()
+			if length > maxFramePayload {
+				b.Release()
 				continue
 			}
-			hdr := buf.New()
+			packetDest := dest
+			if !isConnect && b.UDP != nil {
+				packetDest = singbridge.ToSocksaddr(*b.UDP)
+			}
+			header := buf.New()
 			if !isConnect {
-				src := dest
-				if b.UDP != nil {
-					src = singbridge.ToSocksaddr(*b.UDP)
-				}
-				if err := uot.AddrParser.WriteAddrPort(hdr, src); err != nil {
-					hdr.Release()
+				if err := uot.AddrParser.WriteAddrPort(header, packetDest); err != nil {
+					header.Release()
 					b.Release()
-					continue
+					buf.ReleaseMulti(mb)
+					return
 				}
 			}
-			p := hdr.Extend(2)
-			binary.BigEndian.PutUint16(p, uint16(b.Len()))
-			if err := s.sendStreamData(sid, buf.MultiBuffer{hdr, b}, 0); err != nil {
+			p := header.Extend(2)
+			binary.BigEndian.PutUint16(p, uint16(length))
+			if err := s.sendStreamData(sid, buf.MultiBuffer{header, b}, 0); err != nil {
+				buf.ReleaseMulti(mb)
 				return
 			}
 		}
@@ -479,44 +533,9 @@ func (s *session) sendStreamData(sid uint32, data buf.MultiBuffer, packetIndex u
 	return nil
 }
 
-// serverKeepAlive periodically pings the client with a heartbeat frame. A live
-// client (even one only holding an idle multiplexed stream) replies, which
-// resets the readLoop idle deadline and keeps the session alive. A dead /
-// half-open client never replies, so the idle deadline eventually fires and the
-// session — together with all of its streams and goroutines — is reaped. This
-// is the cure for the connection-accumulation leak. Server-side only.
-func (s *session) serverKeepAlive(stop <-chan struct{}) {
-	ticker := time.NewTicker(anytlsServerHeartInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-			if s.isClosed() {
-				return
-			}
-			// Heartbeats are a v2 feature. Only ping peers that negotiated
-			// v2 so we never send an unknown command to a legacy v1 client.
-			if s.peerVersion < 2 {
-				continue
-			}
-			if err := s.sendFrame(newFrame(cmdHeartRequest, 0)); err != nil {
-				return
-			}
-		}
-	}
-}
-
 func (s *session) readLoop(ctx context.Context) error {
 	var head [7]byte
 	for {
-		// On the server, enforce an idle read deadline. Any inbound frame
-		// (data, heartbeat response, etc.) refreshes it on the next iteration,
-		// so only truly silent/dead connections time out and get cleaned up.
-		if !s.isClient {
-			_ = s.conn.SetReadDeadline(time.Now().Add(anytlsServerIdleTimeout))
-		}
 		_, err := io.ReadFull(s.br, head[:])
 		if err != nil {
 			if s.isClosed() {
@@ -649,7 +668,7 @@ func (s *session) readLoop(ctx context.Context) error {
 				s.finishStream(sid, err)
 				return nil
 			} else if st.isUDP {
-				if err := s.feedUDP(ctx, st, body); err != nil {
+				if err := s.handleUDPFrame(ctx, st, body); err != nil {
 					return err
 				}
 				continue

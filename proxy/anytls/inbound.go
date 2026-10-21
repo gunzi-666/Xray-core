@@ -11,6 +11,7 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/log"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	sessionctx "github.com/xtls/xray-core/common/session"
@@ -20,16 +21,6 @@ import (
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
-)
-
-const (
-	// anytlsServerHeartInterval is how often the server pings an idle client.
-	anytlsServerHeartInterval = 30 * time.Second
-	// anytlsServerIdleTimeout is how long the server tolerates total silence
-	// (no frames, not even a heartbeat reply) before reaping the session.
-	// It must be comfortably larger than the heartbeat interval so that a
-	// single missed/slow reply does not drop a live connection.
-	anytlsServerIdleTimeout = 90 * time.Second
 )
 
 type Server struct {
@@ -89,19 +80,19 @@ func (s *Server) Close() error {
 	return nil
 }
 
-
 func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	sessPol := s.policyManager.ForLevel(0)
 	_ = conn.SetReadDeadline(time.Now().Add(sessPol.Timeouts.Handshake))
 
 	sess := &session{
-		isClient:   false,
-		server:     s,
-		conn:       conn,
-		br:         &buf.BufferedReader{Reader: buf.NewReader(conn)},
-		bw:         buf.NewBufferedWriter(buf.NewWriter(conn)),
-		streams:    make(map[uint32]*stream),
-		dispatcher: dispatcher,
+		isClient:       false,
+		server:         s,
+		conn:           conn,
+		br:             &buf.BufferedReader{Reader: buf.NewReader(conn)},
+		bw:             buf.NewBufferedWriter(buf.NewWriter(conn)),
+		streams:        make(map[uint32]*stream),
+		dispatcher:     dispatcher,
+		connectionIdle: sessPol.Timeouts.ConnectionIdle,
 	}
 	sess.fw = newFrameWriter(sess.bw)
 	sess.peerVersion = 1
@@ -118,20 +109,20 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	snap := s.loadStore()
 	user := snap.users[sum]
 	if user == nil {
-		return errors.New("anytls: invalid user")
+		authErr := errors.New("anytls: invalid user")
+		log.Record(&log.AccessMessage{From: conn.RemoteAddr(), Status: log.AccessRejected, Reason: authErr})
+		return authErr
 	}
 
 	padlen := binary.BigEndian.Uint16(h[32:34])
 	if padlen > 0 {
 		if err := discardBytes(sess.br, int(padlen)); err != nil {
-			return errors.New("anytls: read padding0").Base(err)
+			paddingErr := errors.New("anytls: read padding0").Base(err)
+			log.Record(&log.AccessMessage{From: conn.RemoteAddr(), Status: log.AccessRejected, Reason: paddingErr, Email: user.Email})
+			return paddingErr
 		}
 	}
-	// Switch from the short handshake deadline to a rolling idle deadline that
-	// readLoop refreshes on every received frame. Combined with the heartbeat
-	// goroutine below, this reaps half-open/dead client connections instead of
-	// leaving their goroutines (readLoop + per-stream pumps) blocked forever.
-	_ = conn.SetReadDeadline(time.Now().Add(anytlsServerIdleTimeout))
+	_ = conn.SetReadDeadline(time.Time{})
 
 	inb := sessionctx.InboundFromContext(ctx)
 	inb.Name = protocolName
@@ -143,9 +134,11 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		sess.noTLS = true
 	}
 
-	heartStop := make(chan struct{})
-	defer close(heartStop)
-	go sess.serverKeepAlive(heartStop)
+	sess.lastReadTime = time.Now()
+	sess.br.Reader = &serverIdleReader{Reader: sess.br.Reader, session: sess}
+	idleStop := make(chan struct{})
+	defer close(idleStop)
+	go sess.watchServerIdle(ctx, idleStop)
 
 	return sess.readLoop(ctx)
 }
